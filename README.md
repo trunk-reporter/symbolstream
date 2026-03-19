@@ -1,12 +1,19 @@
-# Symbol Stream Plugin for trunk-recorder
+# symbolstream — Voice Codec Streaming Plugin for trunk-recorder
 
-Streams raw IMBE voice codec data from trunk-recorder to a remote server via TCP or UDP. This gives downstream applications direct access to the pre-vocoder codec parameters — the same data the vocoder uses to synthesize audio, but before any lossy reconstruction.
+Streams raw voice codec symbols (IMBE, AMBE, etc.) from trunk-recorder to a remote server via TCP or UDP. Where `simplestream` sends decoded PCM audio (post-vocoder), symbolstream sends the raw codec parameters before vocoding — giving downstream applications direct access to the pre-vocoder data.
 
-The plugin follows the same configuration pattern as `simplestream`. The receiving server handles all processing (decoding, ASR inference, audio reconstruction, etc).
+Use cases include:
+- **Speech recognition** directly from codec parameters (skip lossy audio reconstruction)
+- **Hardware vocoder offloading** (ThumbDV, DV3000, AMBEserver)
+- **Codec quality analysis** and FEC error monitoring
+- **Compact archival** (codec symbols are ~50x smaller than PCM audio)
+- **Remote/distributed vocoding** — move the CPU-intensive vocoder off the scanner machine
+
+The plugin follows the same configuration pattern as `simplestream`.
 
 ## Requirements
 
-Requires the `voice_codec_data()` plugin API callback, available in trunk-recorder builds with the voice codec plugin API patch.
+Requires the `voice_codec_data()` plugin API callback, available in trunk-recorder builds with the [voice codec plugin API](https://github.com/TrunkRecorder/trunk-recorder/pull/XXXX).
 
 ## Configuration
 
@@ -15,7 +22,7 @@ Add to your `config.json` plugins array:
 ```json
 {
   "name": "symbolstream",
-  "library": "libsymbolstream_plugin",
+  "library": "libsymbolstream",
   "streams": [
     {
       "address": "127.0.0.1",
@@ -42,33 +49,49 @@ Add to your `config.json` plugins array:
 
 Multiple streams can be configured to send to different servers or filter different talkgroups.
 
+## Supported Codecs
+
+The plugin streams whatever `voice_codec_data()` provides. The `codec_type` field identifies the codec:
+
+| Value | Codec | Params | Param Size | Frame Rate | Description |
+|-------|-------|--------|------------|------------|-------------|
+| 0 | P25 Phase 1 IMBE | 8 | 32 bytes | 50 fps | IMBE codewords u[0..7] |
+| 1 | P25 Phase 2 AMBE+2 | 4 | 16 bytes | 50 fps | AMBE+2 codewords |
+| 2 | DMR AMBE | 4 | 16 bytes | 50 fps | AMBE codewords |
+| 3 | D-STAR AMBE | variable | variable | — | AMBE2400 parameters |
+| 4 | YSF Full Rate | 8 | 32 bytes | — | Same format as P25 IMBE |
+| 5 | YSF Half Rate | variable | variable | — | AMBE2250 parameters |
+
+All codec parameters are transmitted as uint32_t (little-endian), with only the lower bits significant. The values are FEC-decoded and ready for direct use by a vocoder or analysis pipeline.
+
 ## Wire Format
 
 ### Codec Frame (sendJSON=false)
 
-Each IMBE voice frame (20ms, 50 frames/sec) is sent as a 40-byte packet:
+A compact fixed-size packet per voice frame:
 
 ```
 Offset  Size  Type        Field
 0       4     uint32_t    talkgroup ID (little-endian)
 4       4     uint32_t    source radio ID (little-endian, 0 if unknown)
-8       32    uint32_t[8] IMBE codewords u[0]..u[7] (little-endian)
+8       N*4   uint32_t[]  codec parameters (N depends on codec_type)
 ```
 
-Total: **40 bytes per frame**, **2000 bytes/sec** per active call.
+For P25 IMBE (codec_type 0): 8 + 32 = **40 bytes per frame**.
+For DMR/AMBE (codec_type 2): 8 + 16 = **24 bytes per frame**.
 
 ### Codec Frame (sendJSON=true)
 
-Each frame is preceded by a JSON metadata header:
+Each frame is preceded by a length-prefixed JSON metadata header:
 
 ```
 Offset  Size  Type        Field
 0       4     uint32_t    JSON length in bytes (little-endian)
 4       N     char[N]     JSON metadata string
-4+N     32    uint32_t[8] IMBE codewords u[0]..u[7] (little-endian)
+4+N     P*4   uint32_t[]  codec parameters
 ```
 
-JSON metadata fields:
+JSON metadata:
 
 ```json
 {
@@ -83,13 +106,7 @@ JSON metadata fields:
 
 ### Call Start Event (sendJSON=true only)
 
-Sent when a new call begins. No codec data follows — JSON only.
-
-```
-Offset  Size  Type        Field
-0       4     uint32_t    JSON length in bytes (little-endian)
-4       N     char[N]     JSON string
-```
+Sent when a new call begins. JSON only, no codec data follows.
 
 ```json
 {
@@ -102,7 +119,7 @@ Offset  Size  Type        Field
 
 ### Call End Event (sendJSON=true only)
 
-Sent when a call terminates. No codec data follows — JSON only.
+Sent when a call terminates. JSON only, no codec data follows.
 
 ```json
 {
@@ -117,43 +134,12 @@ Sent when a call terminates. No codec data follows — JSON only.
 }
 ```
 
-## Codec Types
-
-The `codec_type` field in JSON metadata identifies the voice codec:
-
-| Value | Codec | Parameters | Description |
-|-------|-------|------------|-------------|
-| 0 | P25 Phase 1 IMBE | 8 × uint32_t | IMBE codewords u[0]..u[7] |
-| 1 | P25 Phase 2 AMBE+2 | 4 × uint32_t | AMBE+2 codewords |
-| 2 | DMR AMBE | 4 × uint32_t | AMBE codewords |
-| 3 | D-STAR AMBE | variable | AMBE2400 parameters |
-| 4 | YSF Full Rate | 8 × uint32_t | Same format as P25 IMBE |
-| 5 | YSF Half Rate | variable | AMBE2250 parameters |
-
-Currently only codec_type 0 (P25 Phase 1 IMBE) is implemented.
-
-## IMBE Codeword Format
-
-The 8 IMBE codewords encode one 20ms voice frame:
-
-| Codeword | Bits | Description |
-|----------|------|-------------|
-| u[0] | 12 | Fundamental frequency (pitch) |
-| u[1] | 12 | Voicing decisions |
-| u[2] | 12 | Spectral amplitudes (block 1) |
-| u[3] | 12 | Spectral amplitudes (block 2) |
-| u[4] | 11 | Spectral amplitudes (block 3) |
-| u[5] | 11 | Spectral amplitudes (block 4) |
-| u[6] | 11 | Gain |
-| u[7] | 8 | Reserved |
-
-These are the FEC-decoded codewords, ready for vocoder synthesis or direct ASR processing. Values are stored as uint32_t but only the lower bits are significant.
-
 ## Example: Receiving Frames in Python
 
+### With JSON metadata
+
 ```python
-import socket
-import struct
+import socket, struct, json
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.bind(('0.0.0.0', 9090))
@@ -168,14 +154,15 @@ while True:
     jlen = struct.unpack('<I', hdr)[0]
 
     # Read JSON metadata
-    jdata = conn.recv(jlen).decode('utf-8')
-    meta = json.loads(jdata)
+    meta = json.loads(conn.recv(jlen).decode('utf-8'))
 
     if meta['event'] == 'codec_frame':
-        # Read 32 bytes of IMBE codewords
-        raw = conn.recv(32)
-        u = struct.unpack('<8I', raw)
-        print("TG=%d src=%d u=%s" % (meta['talkgroup'], meta['src'], u))
+        # Parameter count depends on codec_type
+        codec_type = meta.get('codec_type', 0)
+        n_params = 8 if codec_type in (0, 4) else 4
+        raw = conn.recv(n_params * 4)
+        params = struct.unpack('<%dI' % n_params, raw)
+        print("TG=%d codec=%d params=%s" % (meta['talkgroup'], codec_type, params))
 
     elif meta['event'] == 'call_start':
         print("Call start TG=%d" % meta['talkgroup'])
@@ -185,7 +172,7 @@ while True:
             meta['talkgroup'], meta['duration']))
 ```
 
-## Example: Receiving Frames Without JSON
+### Without JSON (P25 IMBE, fixed 40-byte frames)
 
 ```python
 while True:
@@ -197,46 +184,60 @@ while True:
     print("TG=%d src=%d u=%s" % (tgid, src_id, u))
 ```
 
-## Processing IMBE Codewords
+## Use Cases
 
-The codewords can be used for:
+### Audio reconstruction via software vocoder
 
-1. **Audio reconstruction** — Pass through an IMBE vocoder (libimbe) to synthesize 8kHz PCM audio
-2. **ASR inference** — Decode to 170-dim raw parameters via `imbe_decode_params()`, normalize, and run through a Conformer-CTC model
-3. **Codec analysis** — Monitor FEC error rates, signal quality, encryption detection
-4. **Archival** — Store raw codec data for later processing (much smaller than audio)
-
-For ASR, the 170-dim parameter vector layout per frame is:
-
+```python
+# Decode IMBE codewords to PCM audio via libimbe
+import ctypes
+lib = ctypes.CDLL('libimbe.so')
+dec = lib.imbe_create()
+fv = (ctypes.c_int16 * 8)(*[int(x) for x in params])
+snd = (ctypes.c_int16 * 160)()
+lib.imbe_decode(dec, fv, snd)
+# snd now contains 160 samples of 8kHz PCM audio (20ms)
 ```
-[0]       f0 (fundamental frequency)
-[1]       L (number of harmonics, 0-56)
-[2:58]    spectral amplitudes (56 slots, zero-padded)
-[58:114]  voiced/unvoiced flags (56 slots)
-[114:170] binary harmonic validity mask (1=real, 0=pad)
-```
+
+### Audio reconstruction via hardware vocoder (ThumbDV / DV3000)
+
+Forward the raw codewords to an AMBEserver instance connected to a DVSI hardware vocoder for reference-quality audio decode.
+
+### ASR (speech recognition) from codec parameters
+
+Decode codewords to 170-dim parameter vectors via `imbe_decode_params()`, normalize, and feed directly into a Conformer-CTC neural network — bypassing audio reconstruction entirely.
+
+### Compact recording
+
+At 2 KB/s per channel (vs ~128 KB/s for PCM audio), codec symbols are ~50x more compact. Record the raw stream and decode later with any vocoder or analysis tool.
 
 ## Building
 
-The plugin is built as part of the trunk-recorder build:
+Place the plugin source in `trunk-recorder/plugins/symbolstream/` and add to `CMakeLists.txt`:
+
+```cmake
+add_subdirectory(plugins/symbolstream)
+```
+
+Build as part of the trunk-recorder build:
 
 ```bash
 mkdir build && cd build
 cmake ..
-make symbolstream_plugin
+make symbolstream
 sudo make install
 ```
 
-The plugin has no external dependencies beyond trunk-recorder's existing libraries (Boost.Asio, Boost.Log).
+No external dependencies beyond trunk-recorder's existing libraries (Boost.Asio, Boost.Log).
 
 ## Multiple Streams
 
-Configure multiple streams to send different talkgroups to different servers:
+Send different talkgroups to different servers, or the same data to multiple consumers:
 
 ```json
 {
   "name": "symbolstream",
-  "library": "libsymbolstream_plugin",
+  "library": "libsymbolstream",
   "streams": [
     {
       "address": "10.0.0.1",
@@ -260,7 +261,8 @@ Configure multiple streams to send different talkgroups to different servers:
 
 | Mode | Per Frame | Per Call (10s) | Per Active Channel |
 |------|-----------|----------------|--------------------|
-| No JSON | 40 bytes | 20 KB | 2 KB/s |
+| No JSON (IMBE) | 40 bytes | 20 KB | 2 KB/s |
+| No JSON (AMBE) | 24 bytes | 12 KB | 1.2 KB/s |
 | With JSON | ~140 bytes | 70 KB | 7 KB/s |
 
-At 50fps, even with JSON metadata, a single active channel uses only 7 KB/s — negligible for any network.
+Even with JSON metadata on a busy system with 10 simultaneous calls: ~70 KB/s total.
