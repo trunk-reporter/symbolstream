@@ -18,6 +18,7 @@ A future plugin update will add v2 support.
 6. [Codec Type Registry](#6-codec-type-registry)
 7. [Codec Parameter Tables](#7-codec-parameter-tables)
 8. [C Reference Structures and Examples](#8-c-reference-structures-and-examples)
+9. [File Format](#9-file-format)
 9. [Receiver Guide](#9-receiver-guide)
 10. [Bandwidth](#10-bandwidth)
 11. [Compatibility](#11-compatibility)
@@ -752,3 +753,41 @@ Call events (JSON only, no binary tail):
 - Hybrid JSON+binary — awkward to parse, not composable with standard JSON tools
 - Codec type missing from binary mode — receiver must infer from context
 - Only IMBE is sent (codec_type != 0 is filtered out in the plugin)
+
+---
+
+## 9. File Format
+
+### 9.1 File Extension
+
+The canonical file extension for SymbolStream v2 binary captures is **`.dvcf`** (Digital Voice Codec Frames).
+
+A `.dvcf` file is a concatenation of SymbolStream v2 binary messages (§3) representing a single call. The typical structure is:
+
+1. One `CALL_START` message
+2. N × `CODEC_FRAME` messages (one per voice frame, 20ms / 50fps for IMBE)
+3. One `CALL_END` message
+
+### 9.2 MIME Type
+
+`application/x-dvcf` (unregistered; use for HTTP uploads and content-type headers).
+
+### 9.3 File Naming Convention
+
+`.dvcf` files are written as sidecar files alongside audio recordings. Given an audio file:
+
+```
+9173-1774473273.232_852687500.0-call_39.wav
+```
+
+The corresponding codec capture is:
+
+```
+9173-1774473273.232_852687500.0-call_39.dvcf
+```
+
+Same base name, `.dvcf` extension. This allows downstream consumers (e.g., the MQTT plugin, tr-engine) to discover the codec data by replacing the audio file extension.
+
+### 9.4 Relationship to Transport
+
+The file format uses the same binary framing as the TCP/UDP transport (§3). A `.dvcf` file can be replayed over a TCP connection, or a TCP stream can be saved directly to a `.dvcf` file. No additional framing or headers are needed beyond the per-message headers defined in §3.
