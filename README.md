@@ -13,7 +13,7 @@ The plugin follows the same configuration pattern as `simplestream`.
 
 ## Requirements
 
-Requires the `voice_codec_data()` plugin API callback, available in trunk-recorder builds with the [voice codec plugin API](https://github.com/TrunkRecorder/trunk-recorder/pull/XXXX).
+Requires the `voice_codec_data()` plugin API callback, available in the [trunk-reporter fork of trunk-recorder](https://github.com/trunk-reporter/trunk-recorder).
 
 ## Configuration
 
