@@ -11,6 +11,32 @@ Use cases include:
 
 The plugin follows the same configuration pattern as `simplestream`.
 
+## Protocol Specification
+
+The full wire-format specification is in **[SPEC.md](SPEC.md)**. It covers:
+
+- Binary format (v2) — compact, versioned framing with per-frame timestamps and call IDs
+- JSON format (v2) — length-prefixed, fully self-contained JSON (no binary tail)
+- All message types: `CODEC_FRAME`, `CALL_START`, `CALL_END`, `HEARTBEAT`
+- Codec type registry (IMBE, AMBE+2, AMBE, and reserved slots for Codec2/MELPe)
+- Forward-compatibility rules for unknown message and codec types
+- v1 legacy format reference (what the current plugin sends)
+
+A ready-to-run Python receiver is in **[symbolstream_recv.py](symbolstream_recv.py)**:
+
+```bash
+# Binary mode (default)
+python symbolstream_recv.py --port 9090
+
+# JSON mode
+python symbolstream_recv.py --port 9090 --json
+
+# Verbose — print every frame
+python symbolstream_recv.py --verbose
+```
+
+Then point a symbolstream stream at this host/port in your `config.json`.
+
 ## Requirements
 
 Requires the `voice_codec_data()` plugin API callback, available in the [trunk-reporter fork of trunk-recorder](https://github.com/trunk-reporter/trunk-recorder).
