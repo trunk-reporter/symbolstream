@@ -1,6 +1,10 @@
 /*
  * symbolstream_plugin.cc -- Stream raw IMBE voice codec data to a remote server.
  *
+ * Hardened 2026-03-25: error-count threshold (maxErrors config, default 10)
+ *   to reject garbage frames from analog noise decoded as P25 IMBE;
+ *   TCP reconnect with rate limiting (5s backoff); robust connect error handling.
+ *
  * Mirrors simplestream's config pattern but sends raw IMBE codewords
  * (via voice_codec_data) instead of decoded PCM audio. The receiving
  * server handles decoding, inference, and presentation.
@@ -46,6 +50,7 @@
 #include <boost/log/trivial.hpp>
 #include <boost/asio.hpp>
 #include <boost/foreach.hpp>
+#include <chrono>
 
 using namespace boost::asio;
 
@@ -58,6 +63,8 @@ struct symbol_stream_t {
     ip::tcp::socket *tcp_socket;
     bool sendJSON = false;
     bool tcp = false;
+    int maxErrors = 10;
+    std::chrono::steady_clock::time_point last_reconnect_attempt;
 };
 
 static std::vector<symbol_stream_t> symbol_streams;
@@ -86,6 +93,7 @@ public:
             stream.sendJSON = element.value("sendJSON", false);
             stream.tcp = element.value("useTCP", true);
             stream.short_name = element.value("shortName", "");
+            stream.maxErrors = element.value("maxErrors", 10);
 
             BOOST_LOG_TRIVIAL(info) << "[symbolstream] Stream IMBE from TG "
                 << stream.TGID << " to " << stream.address << ":"
@@ -152,6 +160,14 @@ public:
             if (stream.TGID != 0 && stream.TGID != tgid)
                 continue;
 
+            /* Reject frames with high error counts — likely analog noise */
+            if (errs > stream.maxErrors) {
+                BOOST_LOG_TRIVIAL(debug) << "[symbolstream] Dropping frame: errs="
+                    << errs << " > maxErrors=" << stream.maxErrors
+                    << " (tg=" << tgid << ")";
+                continue;
+            }
+
             std::vector<boost::asio::const_buffer> send_buffer;
 
             if (stream.sendJSON) {
@@ -174,11 +190,38 @@ public:
             }
             send_buffer.push_back(buffer(params, param_count * sizeof(uint32_t)));
 
-            if (stream.tcp && stream.tcp_socket) {
-                try {
-                    stream.tcp_socket->send(send_buffer);
-                } catch (std::exception &e) {
-                    BOOST_LOG_TRIVIAL(debug) << "[symbolstream] TCP send error: " << e.what();
+            if (stream.tcp) {
+                /* Attempt TCP reconnect if socket is dead */
+                if (!stream.tcp_socket) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - stream.last_reconnect_attempt).count();
+                    if (elapsed >= 5) {
+                        stream.last_reconnect_attempt = now;
+                        try {
+                            stream.tcp_socket = new ip::tcp::socket(symbol_tcp_io_service);
+                            ip::tcp::endpoint ep(ip::address::from_string(stream.address), stream.port);
+                            stream.tcp_socket->connect(ep);
+                            BOOST_LOG_TRIVIAL(info) << "[symbolstream] TCP reconnected to "
+                                << stream.address << ":" << stream.port;
+                        } catch (std::exception &e) {
+                            BOOST_LOG_TRIVIAL(debug) << "[symbolstream] TCP reconnect failed: " << e.what();
+                            delete stream.tcp_socket;
+                            stream.tcp_socket = nullptr;
+                        }
+                    }
+                }
+
+                if (stream.tcp_socket) {
+                    try {
+                        stream.tcp_socket->send(send_buffer);
+                    } catch (std::exception &e) {
+                        BOOST_LOG_TRIVIAL(debug) << "[symbolstream] TCP send error: " << e.what();
+                        try { stream.tcp_socket->close(); } catch (...) {}
+                        delete stream.tcp_socket;
+                        stream.tcp_socket = nullptr;
+                        stream.last_reconnect_attempt = std::chrono::steady_clock::now();
+                    }
                 }
             } else {
                 udp_socket_.send_to(send_buffer, stream.remote_endpoint, 0, error);

@@ -2,6 +2,11 @@
 """
 symbolstream_recv.py — SymbolStream Protocol v2 Reference Receiver
 
+Hardened 2026-03-25: robust JSON/binary decode error handling (catches
+  UnicodeDecodeError, JSONDecodeError, struct.error); binary resync on
+  corrupt headers; --max-errors flag to drop high-error-count frames
+  (analog noise decoded as P25 IMBE).
+
 Listens for a trunk-recorder symbolstream plugin connection and decodes
 incoming messages. Demonstrates both binary and JSON framing modes.
 
@@ -12,16 +17,20 @@ Usage:
     python symbolstream_recv.py [--port 9090] [--bind 0.0.0.0]
     python symbolstream_recv.py --json          # JSON mode
     python symbolstream_recv.py --verbose       # print every frame
+    python symbolstream_recv.py --max-errors 10 # drop high-error frames
 
 Protocol specification: SPEC.md
 """
 
 import argparse
 import json
+import logging
 import socket
 import struct
 import sys
 from typing import Optional
+
+logger = logging.getLogger("symbolstream_recv")
 
 # ── Protocol constants ────────────────────────────────────────────────────────
 
@@ -103,29 +112,85 @@ def decode_call_end(payload: bytes) -> dict:
                 dur_ms=dur_ms, errs=err_count, enc=bool(enc), sys=sys_name)
 
 
-def run_binary(conn: socket.socket, verbose: bool = False) -> None:
+def _resync_binary(conn: socket.socket) -> bool:
+    """Attempt to resync by scanning for 'SY' magic bytes. Returns True if found."""
+    buf = b''
+    for _ in range(4096):  # scan up to 4K before giving up
+        try:
+            b = conn.recv(1)
+            if not b:
+                return False
+            buf += b
+            if buf[-2:] == MAGIC:
+                return True
+            # keep only last byte for sliding window
+            if len(buf) > 2:
+                buf = buf[-2:]
+        except Exception:
+            return False
+    return False
+
+
+def run_binary(conn: socket.socket, verbose: bool = False,
+               max_errors: int = -1) -> None:
     """Process a v2 binary-mode connection until it closes."""
     calls: dict = {}   # call_id → call metadata from call_start
     frame_count = 0
 
     while True:
-        msg_type, payload = read_binary_message(conn)
+        try:
+            msg_type, payload = read_binary_message(conn)
+        except (ValueError, struct.error, UnicodeDecodeError) as e:
+            logger.debug("Binary parse error: %s — attempting resync", e)
+            if _resync_binary(conn):
+                # We consumed the magic bytes; read the rest of the header
+                try:
+                    rest = recv_exact(conn, HEADER_SIZE - 2)
+                    version = rest[0]
+                    msg_type_r, payload_len = struct.unpack_from('<BI', rest, 1)
+                    payload = recv_exact(conn, payload_len) if payload_len else b''
+                    msg_type = msg_type_r
+                except Exception:
+                    continue
+            else:
+                logger.debug("Resync failed, waiting for more data")
+                continue
 
         if msg_type == MSG_CALL_START:
-            m = decode_call_start(payload)
+            try:
+                m = decode_call_start(payload)
+            except (struct.error, UnicodeDecodeError) as e:
+                logger.debug("Bad CALL_START payload: %s", e)
+                continue
             calls[m['call_id']] = m
             print(f"[CALL START] tg={m['tg']:>8}  call_id={m['call_id']}  "
                   f"freq={m['freq'] / 1e6:.4f} MHz  sys={m['sys']!r}")
 
         elif msg_type == MSG_CALL_END:
-            m = decode_call_end(payload)
+            try:
+                m = decode_call_end(payload)
+            except (struct.error, UnicodeDecodeError) as e:
+                logger.debug("Bad CALL_END payload: %s", e)
+                continue
             calls.pop(m['call_id'], None)
             print(f"[CALL END]   tg={m['tg']:>8}  call_id={m['call_id']}  "
                   f"src={m['src']}  dur={m['dur_ms'] / 1000:.1f}s  "
                   f"errs={m['errs']}  enc={m['enc']}")
 
         elif msg_type == MSG_CODEC_FRAME:
-            m = decode_codec_frame(payload)
+            try:
+                m = decode_codec_frame(payload)
+            except (struct.error, UnicodeDecodeError) as e:
+                logger.debug("Bad CODEC_FRAME payload: %s", e)
+                continue
+            # Filter high-error-count frames (analog garbage)
+            if m['errs'] > 10:
+                logger.debug("High error count frame: errs=%d tg=%d (likely analog)",
+                             m['errs'], m['tg'])
+            if max_errors >= 0 and m['errs'] > max_errors:
+                logger.debug("Dropping frame: errs=%d > max_errors=%d",
+                             m['errs'], max_errors)
+                continue
             frame_count += 1
             codec_name = CODEC_NAMES.get(m['codec'], f"codec_{m['codec']}")
             silence = ' [silence]' if m['flags'] & 0x01 else ''
@@ -155,12 +220,17 @@ def read_json_message(conn: socket.socket) -> dict:
     return json.loads(raw.decode('utf-8'))
 
 
-def run_json(conn: socket.socket, verbose: bool = False) -> None:
+def run_json(conn: socket.socket, verbose: bool = False,
+             max_errors: int = -1) -> None:
     """Process a v2 (or v1-compatible) JSON-mode connection."""
     frame_count = 0
 
     while True:
-        msg = read_json_message(conn)
+        try:
+            msg = read_json_message(conn)
+        except (json.JSONDecodeError, UnicodeDecodeError, struct.error) as e:
+            logger.debug("JSON decode error: %s", e)
+            continue
 
         # v2 uses "type"; v1 uses "event" — handle both
         msg_type = msg.get('type') or msg.get('event', '')
@@ -183,11 +253,18 @@ def run_json(conn: socket.socket, verbose: bool = False) -> None:
                   f"dur={dur:.1f}s  errs={errs}  enc={enc}")
 
         elif msg_type == 'codec_frame':
-            frame_count += 1
             tg     = msg.get('tg', msg.get('talkgroup', 0))
             codec  = msg.get('codec', msg.get('codec_type', 0))
             errs   = msg.get('errs', 0)
             params = msg.get('params', [])
+            # Filter high-error-count frames
+            if errs > 10:
+                logger.debug("High error count frame: errs=%d tg=%d (likely analog)",
+                             errs, tg)
+            if max_errors >= 0 and errs > max_errors:
+                logger.debug("Dropping frame: errs=%d > max_errors=%d", errs, max_errors)
+                continue
+            frame_count += 1
             codec_name = CODEC_NAMES.get(codec, f"codec_{codec}")
             if verbose:
                 print(f"[FRAME] tg={tg}  {codec_name}  errs={errs}"
@@ -218,7 +295,12 @@ def main() -> None:
                    help='JSON framing mode (default: binary)')
     p.add_argument('--verbose', action='store_true',
                    help='Print every codec frame (default: print every 50th)')
+    p.add_argument('--max-errors', type=int, default=-1, metavar='N',
+                   help='Drop codec frames with error count > N (default: disabled)')
     args = p.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format='%(asctime)s %(levelname)s %(message)s')
 
     mode = 'JSON' if args.json else 'binary'
 
@@ -235,9 +317,11 @@ def main() -> None:
             print(f"Connected: {addr[0]}:{addr[1]}")
             try:
                 if args.json:
-                    run_json(conn, verbose=args.verbose)
+                    run_json(conn, verbose=args.verbose,
+                             max_errors=args.max_errors)
                 else:
-                    run_binary(conn, verbose=args.verbose)
+                    run_binary(conn, verbose=args.verbose,
+                               max_errors=args.max_errors)
             except (EOFError, ConnectionError) as e:
                 print(f"Disconnected: {e}")
             except KeyboardInterrupt:
