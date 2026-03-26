@@ -154,17 +154,21 @@ public:
         std::string short_name = call->get_short_name();
         boost::system::error_code error;
 
+        /* On conventional P25, OP25 doesn't know the talkgroup (tgid=0).
+         * Fall back to the call's talkgroup from the channelFile CSV. */
+        long effective_tgid = (tgid != 0) ? tgid : call->get_talkgroup();
+
         BOOST_FOREACH (auto &stream, symbol_streams) {
             if (!stream.short_name.empty() && stream.short_name != short_name)
                 continue;
-            if (stream.TGID != 0 && stream.TGID != tgid)
+            if (stream.TGID != 0 && stream.TGID != effective_tgid)
                 continue;
 
             /* Reject frames with high error counts — likely analog noise */
             if (errs > stream.maxErrors) {
                 BOOST_LOG_TRIVIAL(debug) << "[symbolstream] Dropping frame: errs="
                     << errs << " > maxErrors=" << stream.maxErrors
-                    << " (tg=" << tgid << ")";
+                    << " (tg=" << effective_tgid << ")";
                 continue;
             }
 
@@ -173,7 +177,7 @@ public:
             if (stream.sendJSON) {
                 json j = {
                     {"event", "codec_frame"},
-                    {"talkgroup", tgid},
+                    {"talkgroup", effective_tgid},
                     {"src", src_id},
                     {"codec_type", codec_type},
                     {"errs", errs},
@@ -184,7 +188,7 @@ public:
                 send_buffer.push_back(buffer(&jlen, 4));
                 send_buffer.push_back(buffer(js));
             } else {
-                uint32_t tg32 = (uint32_t)tgid;
+                uint32_t tg32 = (uint32_t)effective_tgid;
                 send_buffer.push_back(buffer(&tg32, 4));
                 send_buffer.push_back(buffer(&src_id, 4));
             }
