@@ -141,6 +141,28 @@ public:
         return 0;
     }
 
+    /* ---- TCP reconnect helper (shared by all send paths) ---- */
+
+    void attempt_tcp_reconnect(symbol_stream_t &stream) {
+        if (stream.tcp_socket) return;  /* already connected */
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            now - stream.last_reconnect_attempt).count();
+        if (elapsed < 5) return;  /* rate-limit: 5s backoff */
+        stream.last_reconnect_attempt = now;
+        try {
+            stream.tcp_socket = new ip::tcp::socket(symbol_tcp_io_service);
+            ip::tcp::endpoint ep(ip::address::from_string(stream.address), stream.port);
+            stream.tcp_socket->connect(ep);
+            BOOST_LOG_TRIVIAL(info) << "[symbolstream] TCP reconnected to "
+                << stream.address << ":" << stream.port;
+        } catch (std::exception &e) {
+            BOOST_LOG_TRIVIAL(debug) << "[symbolstream] TCP reconnect failed: " << e.what();
+            delete stream.tcp_socket;
+            stream.tcp_socket = nullptr;
+        }
+    }
+
     /* ---- Voice codec data: stream IMBE codewords ---- */
 
     int voice_codec_data(Call *call, int codec_type, long tgid,
@@ -195,27 +217,7 @@ public:
             send_buffer.push_back(buffer(params, param_count * sizeof(uint32_t)));
 
             if (stream.tcp) {
-                /* Attempt TCP reconnect if socket is dead */
-                if (!stream.tcp_socket) {
-                    auto now = std::chrono::steady_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                        now - stream.last_reconnect_attempt).count();
-                    if (elapsed >= 5) {
-                        stream.last_reconnect_attempt = now;
-                        try {
-                            stream.tcp_socket = new ip::tcp::socket(symbol_tcp_io_service);
-                            ip::tcp::endpoint ep(ip::address::from_string(stream.address), stream.port);
-                            stream.tcp_socket->connect(ep);
-                            BOOST_LOG_TRIVIAL(info) << "[symbolstream] TCP reconnected to "
-                                << stream.address << ":" << stream.port;
-                        } catch (std::exception &e) {
-                            BOOST_LOG_TRIVIAL(debug) << "[symbolstream] TCP reconnect failed: " << e.what();
-                            delete stream.tcp_socket;
-                            stream.tcp_socket = nullptr;
-                        }
-                    }
-                }
-
+                attempt_tcp_reconnect(stream);
                 if (stream.tcp_socket) {
                     try {
                         stream.tcp_socket->send(send_buffer);
@@ -259,9 +261,20 @@ public:
             send_buffer.push_back(buffer(&jlen, 4));
             send_buffer.push_back(buffer(js));
 
-            if (stream.tcp && stream.tcp_socket) {
-                try { stream.tcp_socket->send(send_buffer); }
-                catch (...) {}
+            if (stream.tcp) {
+                attempt_tcp_reconnect(stream);
+                if (stream.tcp_socket) {
+                    try { stream.tcp_socket->send(send_buffer); }
+                    catch (std::exception &e) {
+                        BOOST_LOG_TRIVIAL(warning) << "[symbolstream] TCP send failed on call_start: " << e.what();
+                        try { stream.tcp_socket->close(); } catch (...) {}
+                        delete stream.tcp_socket;
+                        stream.tcp_socket = nullptr;
+                        stream.last_reconnect_attempt = std::chrono::steady_clock::now();
+                    }
+                } else {
+                    BOOST_LOG_TRIVIAL(warning) << "[symbolstream] TCP unavailable for call_start, dropping (tg=" << tgid << ")";
+                }
             } else {
                 udp_socket_.send_to(send_buffer, stream.remote_endpoint, 0, error);
             }
@@ -294,9 +307,20 @@ public:
             send_buffer.push_back(buffer(&jlen, 4));
             send_buffer.push_back(buffer(js));
 
-            if (stream.tcp && stream.tcp_socket) {
-                try { stream.tcp_socket->send(send_buffer); }
-                catch (...) {}
+            if (stream.tcp) {
+                attempt_tcp_reconnect(stream);
+                if (stream.tcp_socket) {
+                    try { stream.tcp_socket->send(send_buffer); }
+                    catch (std::exception &e) {
+                        BOOST_LOG_TRIVIAL(warning) << "[symbolstream] TCP send failed on call_end: " << e.what();
+                        try { stream.tcp_socket->close(); } catch (...) {}
+                        delete stream.tcp_socket;
+                        stream.tcp_socket = nullptr;
+                        stream.last_reconnect_attempt = std::chrono::steady_clock::now();
+                    }
+                } else {
+                    BOOST_LOG_TRIVIAL(warning) << "[symbolstream] TCP unavailable for call_end, dropping (tg=" << call_info.talkgroup << ")";
+                }
             } else {
                 udp_socket_.send_to(send_buffer, stream.remote_endpoint, 0, error);
             }
