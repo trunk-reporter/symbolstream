@@ -194,6 +194,8 @@ public:
                 continue;
             }
 
+            std::string js;
+            uint32_t jlen = 0;
             std::vector<boost::asio::const_buffer> send_buffer;
 
             if (stream.sendJSON) {
@@ -205,8 +207,8 @@ public:
                     {"errs", errs},
                     {"short_name", short_name},
                 };
-                std::string js = j.dump();
-                uint32_t jlen = js.length();
+                js = j.dump();
+                jlen = js.length();
                 send_buffer.push_back(buffer(&jlen, 4));
                 send_buffer.push_back(buffer(js));
             } else {
