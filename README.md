@@ -239,20 +239,26 @@ At 2 KB/s per channel (vs ~128 KB/s for PCM audio), codec symbols are ~50x more 
 
 ## Building
 
-Place the plugin source in `trunk-recorder/plugins/symbolstream/` and add to `CMakeLists.txt`:
-
-```cmake
-add_subdirectory(plugins/symbolstream)
-```
-
-Build as part of the trunk-recorder build:
+Builds as a `user_plugins` drop-in — no fork of trunk-recorder required. Requires trunk-recorder with `voice_codec_data()` plugin API support (v5.0+).
 
 ```bash
-mkdir build && cd build
-cmake ..
-make symbolstream
-sudo make install
+# 1. Clone trunk-recorder
+git clone https://github.com/TrunkRecorder/trunk-recorder.git
+cd trunk-recorder
+
+# 2. Drop this plugin into user_plugins/
+mkdir -p user_plugins
+git clone https://github.com/trunk-reporter/symbolstream user_plugins/symbolstream
+
+# 3. Build with local plugins enabled
+cmake -B build -DUSE_LOCAL_PLUGINS=ON
+cmake --build build -j$(nproc)
+
+# 4. Install
+sudo cmake --install build
 ```
+
+The compiled `libsymbolstream.so` will be installed to `/usr/local/lib/trunk-recorder/`.
 
 No external dependencies beyond trunk-recorder's existing libraries (Boost.Asio, Boost.Log).
 
